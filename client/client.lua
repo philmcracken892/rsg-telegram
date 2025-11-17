@@ -14,15 +14,65 @@ local howFar = 0
 local senderID = nil
 local sID = nil
 local tPName = nil
-local isReceiving = false
 local buildingNotified = false
 local isBirdCanSpawn = false
 local isBirdAlreadySpawned = false
 local birdTime = Config.BirdTimeout
 local blipEntries = {}
+local cachedPlayers = nil
+local freezedPlayer = false
+local currentMessageId = nil
 
+
+local function GetBirdAttachConfig()
+    local birdModel = Config.BirdModel
+    
+    
+    if not Config.BirdAttach[birdModel] then
+        print("^1[TELEGRAM ERROR]^7 Bird model '" .. birdModel .. "' not found in Config.BirdAttach! Using A_C_Eagle_01 as fallback.")
+        birdModel = "A_C_Eagle_01"
+    end
+    
+    local AttachConfig = Config.BirdAttach[birdModel]
+    local Attach = IsPedMale(PlayerPedId()) and AttachConfig.Male or AttachConfig.Female
+    
+    return Attach
+end
+
+
+local function UpdateMailCount()
+    RSGCore.Functions.TriggerCallback('rsg-telegram:server:getUnreadLetterCount', function(count)
+        LocalPlayer.state:set('telegramUnreadMessages', count or 0, true)
+    end)
+end
+
+
+RegisterNetEvent('rsg-telegram:client:UpdateMailCount')
+AddEventHandler('rsg-telegram:client:UpdateMailCount', function()
+    UpdateMailCount()
+end)
+
+---@deprecated use state LocalPlayer.state.telegramIsBirdPostApproaching
 exports('IsBirdPostApproaching', function()
-    return isReceiving
+    return LocalPlayer.state.telegramIsBirdPostApproaching
+end)
+
+CreateThread(function() 
+    LocalPlayer.state.telegramIsBirdPostApproaching = false
+    repeat Wait(100) until LocalPlayer.state.isLoggedIn
+
+  
+    UpdateMailCount()
+    
+    
+    CreateThread(function()
+        while true do
+            Wait(30000)
+            if LocalPlayer.state.isLoggedIn then
+                UpdateMailCount()
+            end
+        end
+    end)
 end)
 
 -- Bird Prompt
@@ -38,6 +88,11 @@ local BirdPrompt = function()
         PromptSetGroup(birdPrompt, letterPromptGroup)
         PromptRegisterEnd(birdPrompt)
     end)
+end
+
+
+function TaskFlyAway(ped, ped2)
+    return Citizen.InvokeNative(0xE86A537B5A3C297C, ped, ped2)
 end
 
 -- Prompts
@@ -79,12 +134,13 @@ RegisterNetEvent('rsg-telegram:client:TelegramMenu', function()
             args = {}
         },
         {
-            title = locale("cl_title_05"),
+            title = "Send Letter",
             icon = "fa-solid fa-pen-to-square",
-            description = locale("cl_title_06"),
-            event = "rsg-telegram:client:WriteMessagePostOffice",
+            description = "Choose how to send your letter",
+            event = "rsg-telegram:client:ChooseSendMethod",
             args = {}
         },
+        
     }
     lib.registerContext({
         id = "telegram_menu",
@@ -94,7 +150,198 @@ RegisterNetEvent('rsg-telegram:client:TelegramMenu', function()
     lib.showContext("telegram_menu")
 end)
 
--- Write Message
+-- Choose Send Method
+RegisterNetEvent('rsg-telegram:client:ChooseSendMethod', function()
+    local SendMethodMenu = {
+        {
+            title = "Send to Online Players",
+            icon = "fa-solid fa-envelope",
+            description = "Send to online players - stored at post office for retrieval",
+            event = "rsg-telegram:client:SendToOnlinePlayersFromPostOffice",
+            args = {}
+        },
+        {
+            title = "Send to Any Player",
+            icon = "fa-solid fa-search",
+            description = "Search for any player - letter stored at post office",
+            event = "rsg-telegram:client:SendToAnyPlayer",
+            args = {}
+        },
+        {
+            title = "Send to Address Book",
+            icon = "fa-solid fa-address-book",
+            description = "Send to saved contacts - stored at post office",
+            event = "rsg-telegram:client:WriteMessagePostOffice",
+            args = {}
+        },
+        {
+            title = "Back",
+            icon = "fa-solid fa-arrow-left",
+            description = "Return to main menu",
+            event = "rsg-telegram:client:TelegramMenu",
+            args = {}
+        }
+    }
+    lib.registerContext({
+        id = "send_method_menu",
+        title = "Choose Sending Method",
+        options = SendMethodMenu
+    })
+    lib.showContext("send_method_menu")
+end)
+
+
+
+RegisterNetEvent('rsg-telegram:client:SendToOnlinePlayersFromPostOffice', function()
+    RSGCore.Functions.TriggerCallback('rsg-telegram:server:GetPlayers', function(players)
+        local option = {}
+
+        if players ~= nil and #players > 0 then
+            for i = 1, #players do
+                local serverID = players[i].value
+                local fullname = players[i].name
+                local content = {value = serverID, label = players[i].label}
+                option[#option + 1] = content
+            end
+
+            local sendButton = "Send Letter (Free)"
+
+            if Config.ChargePlayer then
+                local lPrice = tonumber(Config.CostPerLetter)
+                sendButton = 'Send Letter ($'..lPrice..')'
+            end
+
+            local input = lib.inputDialog('Send Letter to Online Player', {
+                { type = 'select', options = option, required = true, label = 'Recipient' },
+                { type = 'input', label = 'Subject', required = true },
+                { type = 'textarea', label = 'Message', required = true, autosize = true },
+            })
+            
+            if not input then return end
+
+            local recipient = input[1]  -- server ID
+            local subject = input[2]
+            local message = input[3]
+
+            if recipient and subject and message then
+                local alert = lib.alertDialog({
+                    header = sendButton,
+                    content = "Send this letter via post office?\n\nThe recipient will receive it instantly.",
+                    centered = true,
+                    cancel = true
+                })
+                
+                if alert == 'confirm' then
+                    local pID = PlayerId()
+                    local senderID = GetPlayerServerId(pID)
+                    local playerData = RSGCore.Functions.GetPlayerData()
+                    local senderfullname = playerData.charinfo.firstname..' '..playerData.charinfo.lastname
+                    local sendertelegram = playerData.citizenid
+                    
+                    -- Send directly via post office (no bird)
+                    TriggerServerEvent('rsg-telegram:server:SendMessageToOnlinePlayer', 
+                        senderID, 
+                        sendertelegram, 
+                        senderfullname, 
+                        recipient,
+                        subject, 
+                        message
+                    )
+                end
+            end
+        else
+            lib.notify({ title = "Error", description = "No online players found", type = 'error', duration = 7000 })
+        end
+    end)
+end)
+
+-- Send to Any Player (search database for online/offline players)
+RegisterNetEvent('rsg-telegram:client:SendToAnyPlayer', function()
+    local input = lib.inputDialog('Search for Player', {
+        { 
+            type = 'input', 
+            label = 'Player Name or Citizen ID', 
+            description = 'Enter first name, last name, or citizen ID',
+            required = true,
+            min = 3
+        }
+    })
+    
+    if not input then return end
+    
+    local searchTerm = input[1]
+    
+    -- Search for players in database
+    RSGCore.Functions.TriggerCallback('rsg-telegram:server:SearchPlayers', function(players)
+        if not players or #players == 0 then
+            lib.notify({ 
+                title = "No Results", 
+                description = "No players found matching '"..searchTerm.."'", 
+                type = 'error', 
+                duration = 5000 
+            })
+            return
+        end
+        
+        local option = {}
+        
+        for i = 1, #players do
+            local player = players[i]
+            local status = player.online and "🟢 Online" or "🔴 Offline"
+            local content = {
+                value = player.citizenid, 
+                label = player.name .. " (" .. player.citizenid .. ") " .. status
+            }
+            option[#option + 1] = content
+        end
+        
+        local sendButton = "Send Letter (Free)"
+        
+        if Config.ChargePlayer then
+            local lPrice = tonumber(Config.CostPerLetter)
+            sendButton = 'Send Letter ($'..lPrice..')'
+        end
+        
+        local input2 = lib.inputDialog('Send Letter to Player', {
+            { type = 'select', options = option, required = true, label = 'Select Recipient' },
+            { type = 'input', label = 'Subject', required = true },
+            { type = 'textarea', label = 'Message', required = true, autosize = true },
+        })
+        
+        if not input2 then return end
+        
+        local recipient = input2[1]  -- citizenid
+        local subject = input2[2]
+        local message = input2[3]
+        
+        if recipient and subject and message then
+            local alert = lib.alertDialog({
+                header = sendButton,
+                content = "Send this letter?\n\nIf recipient is online, they get it instantly.\nIf offline, they can retrieve it at the post office.",
+                centered = true,
+                cancel = true
+            })
+            
+            if alert == 'confirm' then
+                local pID = PlayerId()
+                local senderID = GetPlayerServerId(pID)
+                local playerData = RSGCore.Functions.GetPlayerData()
+                local senderfullname = playerData.charinfo.firstname..' '..playerData.charinfo.lastname
+                local sendertelegram = playerData.citizenid
+                
+                TriggerServerEvent('rsg-telegram:server:SendToSearchedPlayer', 
+                    sendertelegram, 
+                    senderfullname, 
+                    recipient,
+                    subject, 
+                    message
+                )
+            end
+        end
+    end, searchTerm)
+end)
+
+
 RegisterNetEvent('rsg-telegram:client:WriteMessagePostOffice', function()
     RSGCore.Functions.TriggerCallback('rsg-telegram:server:GetPlayersPostOffice', function(players)
         local option = {}
@@ -145,7 +392,6 @@ RegisterNetEvent('rsg-telegram:client:WriteMessagePostOffice', function()
             end
         else
             lib.notify({ title = locale("cl_title_11"), description = locale("cl_title_12"), type = 'error', duration = 7000 })
-
         end
     end)
 end)
@@ -158,7 +404,6 @@ local function Prompts()
 
     if destination < 3 and IsPedOnMount(ped) or IsPedOnVehicle(ped) then
         lib.notify({ title = locale("title_11"), description = locale('cl_player_on_horse'), type = 'error', duration = 7000 })
-
         Wait(3000)
         return
     end
@@ -175,7 +420,7 @@ local function Prompts()
         RemoveBlip(birdBlip)
     end
 
-    isReceiving = false
+    LocalPlayer.state.telegramIsBirdPostApproaching = false
     isBirdAlreadySpawned = false
     notified = false
 
@@ -190,99 +435,46 @@ end
 
 -- Set Bird Attribute
 local SetPetAttributes = function(entity)
-    -- SET_ATTRIBUTE_POINTS
     Citizen.InvokeNative(0x09A59688C26D88DF, entity, 0, 1100)
     Citizen.InvokeNative(0x09A59688C26D88DF, entity, 1, 1100)
     Citizen.InvokeNative(0x09A59688C26D88DF, entity, 2, 1100)
-
-    -- ADD_ATTRIBUTE_POINTS
     Citizen.InvokeNative(0x75415EE0CB583760, entity, 0, 1100)
     Citizen.InvokeNative(0x75415EE0CB583760, entity, 1, 1100)
     Citizen.InvokeNative(0x75415EE0CB583760, entity, 2, 1100)
-
-    -- SET_ATTRIBUTE_BASE_RANK
     Citizen.InvokeNative(0x5DA12E025D47D4E5, entity, 0, 10)
     Citizen.InvokeNative(0x5DA12E025D47D4E5, entity, 1, 10)
     Citizen.InvokeNative(0x5DA12E025D47D4E5, entity, 2, 10)
-
-    -- SET_ATTRIBUTE_BONUS_RANK
     Citizen.InvokeNative(0x920F9488BD115EFB, entity, 0, 10)
     Citizen.InvokeNative(0x920F9488BD115EFB, entity, 1, 10)
     Citizen.InvokeNative(0x920F9488BD115EFB, entity, 2, 10)
-
-    -- SET_ATTRIBUTE_OVERPOWER_AMOUNT
     Citizen.InvokeNative(0xF6A7C08DF2E28B28, entity, 0, 5000.0, false)
     Citizen.InvokeNative(0xF6A7C08DF2E28B28, entity, 1, 5000.0, false)
     Citizen.InvokeNative(0xF6A7C08DF2E28B28, entity, 2, 5000.0, false)
 end
 
-local function SetPetBehavior(entity)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), GetHashKey('PLAYER'))
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 143493179)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -2040077242)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 1222652248)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 1077299173)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -887307738)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1998572072)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -661858713)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 1232372459)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1836932466)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 1878159675)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 1078461828)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1535431934)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 1862763509)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1663301869)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1448293989)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1201903818)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -886193798)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1996978098)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 555364152)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -2020052692)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 707888648)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 378397108)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -350651841)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1538724068)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 1030835986)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1919885972)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1976316465)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 841021282)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 889541022)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1329647920)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -319516747)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -767591988)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -989642646)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), 1986610512)
-    SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(entity), -1683752762)
-end
-
--- Place Ped on Ground Properly
-local PlacePedOnGroundProperly = function(hPed, howfar)
-    local playerPed = PlayerPedId()
-    howFar = howfar
-    local x, y, z = table.unpack(GetEntityCoords(playerPed))
-    local found, groundz, normal = GetGroundZAndNormalFor_3dCoord(x - howFar, y, z)
-
-    if found then
-        SetEntityCoordsNoOffset(hPed, x - howFar, y, groundz + normal.z + howFar, true)
-    end
-end
-
 -- Spawn the Bird Post
-local SpawnBirdPost = function(posX, posY, posZ, heading, rfar, x)
-    cuteBird = CreatePed(Config.BirdModel, posX, posY, posZ, heading, 1, 1)
+local SpawnBirdPost = function(posX, posY, posZ, heading, rfar, isIncoming)
+    local playerPed = PlayerPedId()
+    local x, y, z = table.unpack(GetOffsetFromEntityInWorldCoords(playerPed, 0.0, -100.0, 0.1))
+    
+    cuteBird = CreatePed(Config.BirdModel, x, y, z + 50.0, heading, 1, 1)
+    
+    while not IsEntityAPed(cuteBird) do
+        Citizen.Wait(1)
+    end
 
     SetPetAttributes(cuteBird)
-
-    Citizen.InvokeNative(0x013A7BA5015C1372, cuteBird, true) -- SetPedIgnoreDeadBodies
-    Citizen.InvokeNative(0xAEB97D84CDF3C00B, cuteBird, false) -- SetAnimalIsWild
-
+    Citizen.InvokeNative(0x013A7BA5015C1372, cuteBird, true)
+    Citizen.InvokeNative(0xAEB97D84CDF3C00B, cuteBird, false)
     SetRelationshipBetweenGroups(1, GetPedRelationshipGroupHash(cuteBird), GetHashKey('PLAYER'))
+    SetBlockingOfNonTemporaryEvents(cuteBird, true)
+    SetEntityInvincible(cuteBird, true)
+    SetEntityCollision(cuteBird, false, false)
+    Citizen.InvokeNative(0x283978A15512B2FE, cuteBird, true)
+    
+    Wait(500)
 
-    PlacePedOnGroundProperly(cuteBird, rfar)
-
-    Wait(2000)
-
-    Citizen.InvokeNative(0x283978A15512B2FE, cuteBird, true) -- SetRandomOutfitVariation
+    Citizen.InvokeNative(0x283978A15512B2FE, cuteBird, true)
     ClearPedTasks(cuteBird)
     ClearPedSecondaryTask(cuteBird)
     ClearPedTasksImmediately(cuteBird)
@@ -290,26 +482,52 @@ local SpawnBirdPost = function(posX, posY, posZ, heading, rfar, x)
     TaskWanderStandard(cuteBird, 0, 0)
     TaskSetBlockingOfNonTemporaryEvents(cuteBird, 1)
     SetEntityAsMissionEntity(cuteBird, true, true)
-    Citizen.InvokeNative(0xA5C38736C426FCB8, cuteBird, true) -- SetEntityInvincible
+    Citizen.InvokeNative(0xA5C38736C426FCB8, cuteBird, true)
 
     Wait(2000)
 
-    if x == 0 then
-        local blipname = locale("cl_blip_name")
-        local bliphash = -1749618580
+    local blipname = isIncoming and "Incoming Bird Post" or "Outgoing Bird Post"
+    local bliphash = -1749618580
 
-        Debug("bliphash", bliphash)
-
-        birdBlip = Citizen.InvokeNative(0x23F74C2FDA6E7C61, bliphash, cuteBird) -- BlipAddForEntity
-        Citizen.InvokeNative(0x9CB1A1623062F402, birdBlip, blipname) -- SetBlipName
-        -- Citizen.InvokeNative(0x931B241409216C1F, targetPed, cuteBird, true) -- SetPedOwnsAnimal
-        Citizen.InvokeNative(0x0DF2B55F717DDB10, birdBlip) -- SetBlipFlashes
-        Citizen.InvokeNative(0x662D364ABF16DE2F, birdBlip, GetHashKey("BLIP_MODIFIER_DEBUG_BLUE")) -- BlipAddModifier
-        SetBlipScale(birdBlip, 2.0)
+    birdBlip = Citizen.InvokeNative(0x23F74C2FDA6E7C61, bliphash, cuteBird)
+    Citizen.InvokeNative(0x9CB1A1623062F402, birdBlip, blipname)
+    Citizen.InvokeNative(0x0DF2B55F717DDB10, birdBlip)
+    
+    if isIncoming then
+        Citizen.InvokeNative(0x662D364ABF16DE2F, birdBlip, GetHashKey("BLIP_MODIFIER_DEBUG_BLUE"))
+    else
+        Citizen.InvokeNative(0x662D364ABF16DE2F, birdBlip, GetHashKey("BLIP_MODIFIER_DEBUG_YELLOW"))
     end
+    
+    SetBlipScale(birdBlip, 0.8)
 end
 
--- Prompt Thread
+
+CreateThread(function()
+    while true do
+        Wait(500)
+        
+        if cuteBird and DoesEntityExist(cuteBird) and birdBlip then
+            local playerPed = PlayerPedId()
+            local playerCoords = GetEntityCoords(playerPed)
+            local birdCoords = GetEntityCoords(cuteBird)
+            local distance = #(playerCoords - birdCoords)
+            
+            if not DoesBlipExist(birdBlip) then
+                local blipname = LocalPlayer.state.telegramIsBirdPostApproaching and "Incoming Bird Post" or "Outgoing Bird Post"
+                birdBlip = Citizen.InvokeNative(0x23F74C2FDA6E7C61, -1749618580, cuteBird)
+                Citizen.InvokeNative(0x9CB1A1623062F402, birdBlip, blipname)
+                SetBlipScale(birdBlip, 0.8)
+            end
+            
+            if distance < 20 then
+                Citizen.InvokeNative(0x662D364ABF16DE2F, birdBlip, GetHashKey("BLIP_MODIFIER_DEBUG_GREEN"))
+            end
+        end
+    end
+end)
+
+
 CreateThread(function()
     BirdPrompt()
 
@@ -329,73 +547,152 @@ end)
 
 -- Receive Message
 RegisterNetEvent('rsg-telegram:client:ReceiveMessage')
-AddEventHandler('rsg-telegram:client:ReceiveMessage', function(SsID, StPName)
-    isReceiving = true
+AddEventHandler('rsg-telegram:client:ReceiveMessage', function(SsID, StPName, letterData)
+    LocalPlayer.state.telegramIsBirdPostApproaching = true
     sID = SsID
     tPName = StPName
     local ped = PlayerPedId()
     local rFar = math.random(50, 100)
+    buildingNotified = false
+    notified = false
+    isBirdAlreadySpawned = false
+    birdTime = Config.BirdTimeout or 300
 
-    while isReceiving do
+    while LocalPlayer.state.telegramIsBirdPostApproaching do
         Wait(1)
-
         playerCoords = GetEntityCoords(ped)
-        local birdCoords = GetEntityCoords(cuteBird)
         local myCoords = vector3(playerCoords.x, playerCoords.y, playerCoords.z)
-        destination = #(birdCoords - myCoords)
-
         local insideBuilding = GetInteriorFromEntity(ped)
-
         isBirdCanSpawn = true
 
         if insideBuilding ~= 0 then
             if not buildingNotified then
-                lib.notify({ title = locale("cl_title_11"), description = locale('cl_inside_building'), type = 'error', duration = 7000 })
+                lib.notify({ title = "Bird Post", description = "The bird cannot find you inside. Go outside!", type = 'error', duration = 7000 })
                 buildingNotified = true
             end
-
             isBirdCanSpawn = false
-
             goto continue
         end
 
         if isBirdCanSpawn and not isBirdAlreadySpawned then
-            SpawnBirdPost(playerCoords.x - 100, playerCoords.y - 100, playerCoords.z + 100, 92.0, rFar, 0)
-            TaskFlyToCoord(cuteBird, 0, playerCoords.x - 1, playerCoords.y - 1, playerCoords.z, 1, 0)
-            isBirdCanSpawn = false
-            isBirdAlreadySpawned = true
+            SpawnBirdPost(playerCoords.x - 100, playerCoords.y - 100, playerCoords.z + 100, 92.0, rFar, true)
+            if cuteBird then
+                ClearPedTasks(cuteBird)
+                Wait(100)
+                TaskFlyToCoord(cuteBird, 1.0, playerCoords.x, playerCoords.y, playerCoords.z + 0.8, 1, 0)
+                isBirdCanSpawn = false
+                isBirdAlreadySpawned = true
+            end
         end
 
-        if destination < 100 and not notified then
-            notified = true
-            lib.notify({ title = locale("cl_title_13"), description = locale('cl_bird_approaching'), type = 'info', duration = 7000 })
-            Wait(5000)
-            lib.notify({ title = locale("cl_title_13"), description = locale('cl_wait_for_bird'), type = 'info', duration = 7000 })
+        if cuteBird then
+            local birdCoords = GetEntityCoords(cuteBird)
+            destination = #(birdCoords - myCoords)
+
+            if destination < 100 and not notified then
+                notified = true
+                lib.notify({ title = "Bird Post", description = "A bird is approaching with a letter!", type = 'info', duration = 7000 })
+                Wait(5000)
+                lib.notify({ title = "Bird Post", description = "Wait for the bird to land...", type = 'info', duration = 7000 })
+            end
+
+            if destination <= 10 and not freezedPlayer then
+                FreezeEntityPosition(ped, true)
+                SetEntityInvincible(ped, true)
+                freezedPlayer = true
+            end
+
+            if destination <= 2.5 then
+                local pc2 = GetEntityCoords(PlayerPedId())
+                local dist2 = GetDistanceBetweenCoords(GetEntityCoords(cuteBird), pc2, true)
+                if dist2 > 1.2 then
+                    ClearPedTasks(cuteBird)
+                    TaskFlyToCoord(cuteBird, 1.0, pc2.x, pc2.y, pc2.z + 0.5, 1, 0)
+                end
+                
+                while dist2 > 1.5 do
+                    dist2 = GetDistanceBetweenCoords(GetEntityCoords(cuteBird), pc2, true)
+                    Citizen.Wait(100)
+                end
+                
+                ClearPedTasks(ped)
+                ClearPedSecondaryTask(ped)
+                FreezeEntityPosition(ped, false)
+                SetEntityInvincible(ped, true)
+                ---TaskStartScenarioInPlace(ped, GetHashKey('WORLD_HUMAN_WRITE_NOTEBOOK'), -1, true, false, false, false)
+                
+                local Attach = GetBirdAttachConfig()
+
+                AttachEntityToEntity(
+                    cuteBird,
+                    PlayerPedId(),
+                    Attach[1], Attach[2], Attach[3], Attach[4], Attach[5], Attach[6], Attach[7],
+                    false, false, true, false, 0, true, false, false
+                )
+
+                ClearPedTasksImmediately(cuteBird)
+                SetBlockingOfNonTemporaryEvents(cuteBird, true)
+                FreezeEntityPosition(cuteBird, true)
+
+                Wait(2000)
+
+                TriggerServerEvent('rsg-telegram:server:GiveLetter', letterData)
+
+                Wait(1000)
+
+                if IsEntityAttached(cuteBird) then
+                    DetachEntity(cuteBird, 1, 1)
+                end
+                if IsEntityFrozen(cuteBird) then
+                    FreezeEntityPosition(cuteBird, false)
+                end
+                SetEntityCollision(cuteBird, false, false)
+                
+                ClearPedTasks(cuteBird)
+                Wait(100)
+                
+                TaskFlyAway(cuteBird, PlayerPedId())
+
+                Wait(Config.BirdArrivalDelay)
+
+                SetEntityInvincible(cuteBird, false)
+                SetEntityCanBeDamaged(cuteBird, true)
+                SetEntityAsMissionEntity(cuteBird, false, false)
+                SetEntityAsNoLongerNeeded(cuteBird)
+                DeleteEntity(cuteBird)
+
+                if birdBlip ~= nil then
+                    RemoveBlip(birdBlip)
+                end
+
+                FreezeEntityPosition(ped, false)
+                SetEntityInvincible(ped, false)
+                ClearPedTasks(ped)
+                ClearPedSecondaryTask(ped)
+
+                TriggerServerEvent('rsg-telegram:server:DeliverySuccess', sID, tPName)
+                LocalPlayer.state.telegramIsBirdPostApproaching = false
+                freezedPlayer = false
+                return
+            end
         end
 
         local IsPedAir = IsEntityInAir(cuteBird, 1)
-        local isBirdDead = Citizen.InvokeNative(0x7D5B1F88E7504BBA, cuteBird) -- IsEntityDead
-
+        local isBirdDead = Citizen.InvokeNative(0x7D5B1F88E7504BBA, cuteBird)
         BirdCoords = GetEntityCoords(cuteBird)
-
-        Debug("cuteBird", cuteBird)
-        Debug("IsPedAir", IsPedAir)
-        Debug("notified", notified)
-        Debug("destination", destination)
 
         if cuteBird ~= nil and not IsPedAir and notified and destination > 3 then
             if Config.AutoResurrect and isBirdDead then
-                Debug("isBirdDead", isBirdDead)
-
                 ClearPedTasksImmediately(cuteBird)
-
                 SetEntityCoords(cuteBird, BirdCoords.x, BirdCoords.y, BirdCoords.z)
                 Wait(1000)
-                Citizen.InvokeNative(0x71BC8E838B9C6035, cuteBird) -- ResurrectPed
+                Citizen.InvokeNative(0x71BC8E838B9C6035, cuteBird)
                 Wait(1000)
             end
-
-            TaskFlyToCoord(cuteBird, 0, myCoords.x - 1, myCoords.y - 1, myCoords.z, 1, 0)
+            
+            ClearPedTasks(cuteBird)
+            Wait(50)
+            TaskFlyToCoord(cuteBird, 1.0, myCoords.x, myCoords.y, myCoords.z + 0.5, 1, 0)
         end
 
         if birdTime > 0 then
@@ -404,21 +701,20 @@ AddEventHandler('rsg-telegram:client:ReceiveMessage', function(SsID, StPName)
         end
 
         if birdTime == 0 and cuteBird ~= nil and notified then
-            lib.notify({ title = locale("cl_title_11"), description = locale('cl_delivery_fail1'), type = 'error', duration = 7000 })
-            Wait(8000)
-            lib.notify({ title = locale("cl_title_11"), description = locale('cl_delivery_fail2'), type = 'error', duration = 7000 })
-            Wait(8000)
-            lib.notify({ title = locale("cl_title_11"), description = locale('cl_delivery_fail3'), type = 'error', duration = 7000 })
-
+            lib.notify({ title = "Delivery Failed", description = "The bird couldn't deliver the letter", type = 'error', duration = 7000 })
+            Wait(3000)
+            lib.notify({ title = "Delivery Failed", description = "The letter will be waiting at the post office", type = 'error', duration = 7000 })
+            
+            TriggerServerEvent('rsg-telegram:server:SaveFailedDelivery', letterData)
+            
             SetEntityInvincible(cuteBird, false)
             SetEntityAsMissionEntity(cuteBird, false, false)
             SetEntityAsNoLongerNeeded(cuteBird)
             DeleteEntity(cuteBird)
             RemoveBlip(birdBlip)
-
             notified = false
-            isReceiving = false
-
+            LocalPlayer.state.telegramIsBirdPostApproaching = false
+            freezedPlayer = false
             return
         end
 
@@ -426,22 +722,101 @@ AddEventHandler('rsg-telegram:client:ReceiveMessage', function(SsID, StPName)
     end
 end)
 
--- Write the Message
+
+
 RegisterNetEvent('rsg-telegram:client:WriteMessage', function()
+    local selectionMenu = {
+        {
+            title = "Online Players (Bird Delivery)",
+            icon = "fa-solid fa-dove",
+            description = "Send via bird - immersive delivery directly to player",
+            event = "rsg-telegram:client:SendToOnlinePlayers",
+            args = {}
+        },
+        {
+            title = "Address Book (Post Office)",
+            icon = "fa-solid fa-address-book", 
+            description = "Send to saved contacts - stored at post office",
+            event = "rsg-telegram:client:SendToAddressBookViaBird",
+            args = {}
+        }
+    }
+    
+    lib.registerContext({
+        id = "send_message_selection",
+        title = "Send Bird Post",
+        options = selectionMenu
+    })
+    lib.showContext("send_message_selection")
+end)
+
+RegisterNetEvent('rsg-telegram:client:SendToAddressBookViaBird', function()
+    RSGCore.Functions.TriggerCallback('rsg-telegram:server:GetPlayersPostOffice', function(players)
+        local option = {}
+
+        if players~=nil then
+            for i = 1, #players do
+                local citizenid = players[i].citizenid
+                local fullname = players[i].name
+                local content = {value = citizenid, label = fullname..' ('..citizenid..')'}
+
+                option[#option + 1] = content
+            end
+
+            local sendButton = locale("cl_send_button_free")
+
+            if Config.ChargePlayer then
+                local lPrice = tonumber(Config.CostPerLetter)
+                sendButton = locale('cl_send_button_paid') ..' $'..lPrice
+            end
+
+            local input = lib.inputDialog(locale('cl_send_message_header'), {
+                { type = 'select', options = option, required = true, default = 'Recipient' },
+                { type = 'input', label = locale("cl_title_08"), required = true },
+                { type = 'textarea', label = locale("cl_title_09"), required = true, autosize = true },
+            })
+            if not input then return end
+
+            local recipient = input[1]
+            local subject = input[2]
+            local message = input[3]
+
+            if recipient and subject and message then
+                local alert = lib.alertDialog({
+                    header = sendButton,
+                    content = "Send this letter?\n\nIf recipient is online, they'll get it via bird.\nIf offline, it will be stored at post office.",
+                    centered = true,
+                    cancel = true
+                })
+                if alert == 'confirm' then
+                    local pID =  PlayerId()
+                    local senderID = GetPlayerServerId(pID)
+                    local senderfirstname = RSGCore.Functions.GetPlayerData().charinfo.firstname
+                    local senderlastname = RSGCore.Functions.GetPlayerData().charinfo.lastname
+                    local sendertelegram = RSGCore.Functions.GetPlayerData().citizenid
+                    local senderfullname = senderfirstname..' '..senderlastname
+                    TriggerServerEvent('rsg-telegram:server:SendMessagePostOffice', sendertelegram, senderfullname, recipient, subject, message)
+                end
+            end
+        else
+            lib.notify({ title = locale("cl_title_11"), description = locale("cl_title_12"), type = 'error', duration = 7000 })
+        end
+    end)
+end)
+
+
+RegisterNetEvent('rsg-telegram:client:SendToOnlinePlayers', function()
     RSGCore.Functions.TriggerCallback('rsg-telegram:server:GetPlayers', function(players)
         if players ~= nil then
-            local citizenid = 0
-            local name = 0
-            local sourceplayer = 0
             local option = {}
 
-            if isReceiving then
+            if LocalPlayer.state.telegramIsBirdPostApproaching then
                 lib.notify({ title = locale("cl_title_11"), description = locale('cl_send_receiving'), type = 'error', duration = 7000 })
                 return
             end
 
             local ped = PlayerPedId()
-            local pID =  PlayerId()
+            local pID = PlayerId()
             senderID = GetPlayerServerId(pID)
 
             if IsPedOnMount(ped) or IsPedOnVehicle(ped) then
@@ -455,33 +830,54 @@ RegisterNetEvent('rsg-telegram:client:WriteMessage', function()
             SetEntityInvincible(ped, true)
 
             playerCoords = GetEntityCoords(ped)
-            targetCoords = GetEntityCoords(targetPed)
-            local coordsOffset = math.random(200, 300)
-
             local heading = GetEntityHeading(ped)
             local rFar = 30
 
             TaskWhistleAnim(ped, GetHashKey('WHISTLEHORSELONG'))
 
-            SpawnBirdPost(playerCoords.x, playerCoords.y - rFar, playerCoords.z, heading, rFar)
+            SpawnBirdPost(playerCoords.x, playerCoords.y - rFar, playerCoords.z, heading, rFar, false)
+            SetEntityCollision(cuteBird, false, false)
 
             if cuteBird == nil then
                 lib.notify({ title = locale("cl_title_11"), description = locale("cl_title_14"), type = 'error', duration = 7000 })
                 return
             end
 
-            TaskFlyToCoord(cuteBird, 1, playerCoords.x, playerCoords.y, playerCoords.z, 1, 1)
+            ClearPedTasks(cuteBird)
+            Wait(100)
+            TaskFlyToCoord(cuteBird, 1.0, playerCoords.x, playerCoords.y, playerCoords.z + 0.5, 1, 0)
             TaskStartScenarioInPlace(ped, GetHashKey('WORLD_HUMAN_WRITE_NOTEBOOK'), -1, true, false, false, false)
 
-            while true do
-                local birdPos = GetEntityCoords(cuteBird)
-                local distance = #(birdPos - playerCoords)
-
-                if distance > 1 then
-                    Wait(1000)
-                else
-                    break
+            Citizen.CreateThread(function()
+                local pc = GetEntityCoords(PlayerPedId())
+                while true do
+                    Citizen.Wait(500)
+                    local dist = GetDistanceBetweenCoords(pc, GetEntityCoords(cuteBird), true)
+                    if dist < 5.0 then
+                        local pc2 = GetEntityCoords(PlayerPedId())
+                        local dist2 = GetDistanceBetweenCoords(GetEntityCoords(cuteBird), pc2, true)
+                        if dist2 > 1.2 then
+                            ClearPedTasks(cuteBird)
+                            TaskFlyToCoord(cuteBird, 1.0, pc2.x, pc2.y, pc2.z + 0.5, 1, 0)
+                        end
+                        while dist2 > 1.5 do
+                            dist2 = GetDistanceBetweenCoords(GetEntityCoords(cuteBird), pc2, true)
+                            Citizen.Wait(100)
+                        end
+                        
+                        local Attach = GetBirdAttachConfig()
+                        
+                        AttachEntityToEntity(cuteBird, PlayerPedId(), Attach[1], Attach[2], Attach[3], Attach[4], Attach[5], Attach[6], Attach[7], false, false, true, false, 0, true, false, false)
+                        ClearPedTasksImmediately(cuteBird)
+                        SetBlockingOfNonTemporaryEvents(cuteBird, true)
+                        FreezeEntityPosition(cuteBird, true)
+                        break
+                    end
                 end
+            end)
+            
+            while not IsEntityAttached(cuteBird) do
+                Citizen.Wait(100)
             end
 
             local sendButton = locale("cl_send_button_free")
@@ -492,11 +888,7 @@ RegisterNetEvent('rsg-telegram:client:WriteMessage', function()
 
             for i = 1, #players do
                 local targetPlayer = players[i]
-
-                citizenid = targetPlayer.citizenid
-                name = targetPlayer.name
-                local content = {value = citizenid, label = '('..citizenid..') '..name}
-
+                local content = { value = targetPlayer.value, label = targetPlayer.label }
                 option[#option + 1] = content
             end
 
@@ -512,9 +904,17 @@ RegisterNetEvent('rsg-telegram:client:WriteMessage', function()
                 ClearPedTasks(PlayerPedId())
                 ClearPedSecondaryTask(PlayerPedId())
 
+                if IsEntityAttached(cuteBird) then
+                    DetachEntity(cuteBird, 1, 1)
+                end
+                if IsEntityFrozen(cuteBird) then
+                    FreezeEntityPosition(cuteBird, false)
+                end
+
                 SetEntityInvincible(cuteBird, false)
                 SetEntityCanBeDamaged(cuteBird, true)
                 SetEntityAsMissionEntity(cuteBird, false, false)
+                SetEntityCollision(cuteBird, false, false)
                 SetEntityAsNoLongerNeeded(cuteBird)
                 DeleteEntity(cuteBird)
 
@@ -523,61 +923,89 @@ RegisterNetEvent('rsg-telegram:client:WriteMessage', function()
                 end
 
                 lib.notify({ title = locale("cl_title_11"), description = locale('cl_cancel_send'), type = 'error', duration = 7000 })
-
                 return
             end
 
             local recipient = input[1]
             local subject = input[2]
             local message = input[3]
-            if recipient and subject and message then
-                local alert = lib.alertDialog({
-                    header = sendButton,
-                    content = locale("cl_title_10"),
-                    centered = true,
-                    cancel = true
-                })
-                if alert == 'confirm' then
+            
+            local alert = lib.alertDialog({
+                header = sendButton,
+                content = locale("cl_title_10"),
+                centered = true,
+                cancel = true
+            })
 
-                    Debug("recipient", recipient)
-                    Debug("subject", subject)
-                    Debug("message", message)
+            if alert == 'confirm' then
+                local senderfirstname = RSGCore.Functions.GetPlayerData().charinfo.firstname
+                local senderlastname = RSGCore.Functions.GetPlayerData().charinfo.lastname
+                local sendertelegram = RSGCore.Functions.GetPlayerData().citizenid
+                local senderfullname = senderfirstname..' '..senderlastname
 
-                    local senderfirstname = RSGCore.Functions.GetPlayerData().charinfo.firstname
-                    local senderlastname = RSGCore.Functions.GetPlayerData().charinfo.lastname
-                    local sendertelegram = RSGCore.Functions.GetPlayerData().citizenid
-                    local senderfullname = senderfirstname..' '..senderlastname
-
-                    Debug("sendertelegram:", sendertelegram)
-                    Debug("senderfullname:", senderfullname)
-                    Debug("recipient:", recipient)
-                    Debug("subject:", subject)
-                    Debug("message:", message)
-
-                    Debug("targetPed:", targetPed)
-
-                    FreezeEntityPosition(ped, false)
-                    SetEntityInvincible(ped, false)
-                    ClearPedTasks(ped)
-                    ClearPedSecondaryTask(ped)
-
-                    Wait(3000)
-
-                    TaskFlyToCoord(cuteBird, 0, targetCoords.x - coordsOffset, targetCoords.y - coordsOffset, targetCoords.z + 75, 1, 0)
-
-                    Wait(Config.BirdArrivalDelay)
-
-                    SetEntityInvincible(cuteBird, false)
-                    SetEntityCanBeDamaged(cuteBird, true)
-                    SetEntityAsMissionEntity(cuteBird, false, false)
-                    SetEntityAsNoLongerNeeded(cuteBird)
-                    DeleteEntity(cuteBird)
-                    RemoveBlip(birdBlip)
-
-                    TriggerServerEvent('rsg-telegram:server:SendMessage', senderID, sendertelegram, senderfullname, recipient, locale('cl_message_prefix')..': '..subject, message)
-                else
-                    lib.notify({ title = locale("cl_title_15"), description = locale("cl_title_16"),'', type = 'error' })
+                if IsEntityAttached(cuteBird) then
+                    DetachEntity(cuteBird, 1, 1)
                 end
+                if IsEntityFrozen(cuteBird) then
+                    FreezeEntityPosition(cuteBird, false)
+                end
+                SetEntityCollision(cuteBird, false, false)
+
+                FreezeEntityPosition(ped, false)
+                SetEntityInvincible(ped, false)
+                ClearPedTasks(ped)
+                ClearPedSecondaryTask(ped)
+
+                ClearPedTasks(cuteBird)
+                Wait(100)
+                TaskFlyAway(cuteBird, PlayerPedId())
+
+                Wait(Config.BirdArrivalDelay)
+
+                SetEntityInvincible(cuteBird, false)
+                FreezeEntityPosition(cuteBird, false)
+                SetEntityCanBeDamaged(cuteBird, true)
+                SetEntityAsMissionEntity(cuteBird, false, false)
+                SetEntityAsNoLongerNeeded(cuteBird)
+                DeleteEntity(cuteBird)
+                
+                if birdBlip ~= nil then
+                    RemoveBlip(birdBlip)
+                end
+
+                TriggerServerEvent('rsg-telegram:server:SendMessage', 
+                    senderID, 
+                    sendertelegram, 
+                    senderfullname, 
+                    recipient,
+                    subject, 
+                    message
+                )
+            else
+                FreezeEntityPosition(ped, false)
+                SetEntityInvincible(ped, false)
+                ClearPedTasks(ped)
+                ClearPedSecondaryTask(ped)
+
+                if IsEntityAttached(cuteBird) then
+                    DetachEntity(cuteBird, 1, 1)
+                end
+                if IsEntityFrozen(cuteBird) then
+                    FreezeEntityPosition(cuteBird, false)
+                end
+                
+                SetEntityInvincible(cuteBird, false)
+                SetEntityCanBeDamaged(cuteBird, true)
+                SetEntityAsMissionEntity(cuteBird, false, false)
+                SetEntityCollision(cuteBird, false, false)
+                SetEntityAsNoLongerNeeded(cuteBird)
+                DeleteEntity(cuteBird)
+
+                if birdBlip ~= nil then
+                    RemoveBlip(birdBlip)
+                end
+
+                lib.notify({ title = locale("cl_title_15"), description = locale("cl_title_16"), type = 'error' })
             end
         else
             lib.notify({ title = locale("cl_title_15"), description = locale("cl_title_16"), type = 'error' })
@@ -585,87 +1013,201 @@ RegisterNetEvent('rsg-telegram:client:WriteMessage', function()
     end)
 end)
 
--- Read the Message
+
+RegisterNetEvent('rsg-telegram:client:ReadLetter')
+AddEventHandler('rsg-telegram:client:ReadLetter', function(letterData, slot)
+   
+    TriggerServerEvent('rsg-telegram:server:MarkLetterRead', slot)
+    
+   
+    local letterContent = string.format(
+        "**From:** %s  \n" ..
+        "**To:** %s  \n" ..
+        "**Date:** %s  \n\n" ..
+        "---\n\n" ..
+        "%s\n\n" ..
+        "---",
+        letterData.sender or "Unknown",
+        letterData.recipient or "You",
+        letterData.date or "Unknown",
+        letterData.message or "The letter is blank"
+    )
+
+    local choice = lib.alertDialog({
+        header = '📨 ' .. (letterData.subject or "Letter"),
+        content = letterContent,
+        centered = true,
+        cancel = true,
+        labels = {
+            confirm = 'Letter Actions',
+            cancel = 'Close'
+        }
+    })
+    
+    if choice == 'confirm' then
+        local actionOptions = {
+            {
+                title = "Read Again",
+                icon = 'fa-solid fa-envelope-open',
+                iconColor = 'blue',
+                description = "Open the letter again",
+                onSelect = function()
+                    TriggerEvent('rsg-telegram:client:ReadLetter', letterData, slot)
+                end
+            },
+            {
+                title = "Copy Message",
+                icon = 'fa-solid fa-copy',
+                iconColor = 'green',
+                description = "Copy message text to clipboard",
+                onSelect = function()
+                    lib.setClipboard(letterData.message)
+                    lib.notify({ 
+                        title = "Copied", 
+                        description = "Message copied to clipboard", 
+                        type = 'success', 
+                        duration = 3000 
+                    })
+                end
+            },
+            {
+                title = "Burn Letter",
+                icon = 'fa-solid fa-fire',
+                iconColor = 'red',
+                description = "Destroy this letter permanently",
+                onSelect = function()
+                    local alert = lib.alertDialog({
+                        header = 'Burn Letter?',
+                        content = 'Are you sure you want to destroy this letter?\n\nThis cannot be undone.',
+                        centered = true,
+                        cancel = true,
+                        labels = {
+                            confirm = 'Burn It',
+                            cancel = 'Keep It'
+                        }
+                    })
+                    if alert == 'confirm' then
+                        TriggerServerEvent('rsg-telegram:server:DestroyLetter', slot)
+                    end
+                end
+            },
+            {
+                title = "Keep Letter",
+                icon = 'fa-solid fa-hand-holding',
+                iconColor = 'yellow',
+                description = "Store the letter in your inventory",
+                onSelect = function()
+                    lib.notify({ 
+                        title = "Letter Kept", 
+                        description = "The letter remains in your inventory", 
+                        type = 'info', 
+                        duration = 3000 
+                    })
+                end
+            }
+        }
+
+        lib.registerContext({
+            id = 'letter_actions',
+            title = 'Letter Actions',
+            options = actionOptions
+        })
+        lib.showContext('letter_actions')
+    end
+end)
+
 RegisterNetEvent('rsg-telegram:client:ReadMessages')
 AddEventHandler('rsg-telegram:client:ReadMessages', function()
-    InMenu = true
-    SetNuiFocus(true, true)
-
-    SendNUIMessage
-    ({
-        type = 'openGeneral'
-    })
-
     TriggerServerEvent('rsg-telegram:server:CheckInbox')
 end)
 
--- Show Messages List
+
 RegisterNetEvent('rsg-telegram:client:InboxList')
 AddEventHandler('rsg-telegram:client:InboxList', function(data)
-    SendNUIMessage
-    ({
-        type = 'inboxlist', response = data
-    })
-end)
-
--- Get the Message
-RegisterNUICallback('getview', function(data)
-    TriggerServerEvent('rsg-telegram:server:GetMessages', tonumber(data.id))
-    TriggerServerEvent('rsg-telegram:server:CheckInbox')
-end)
-
--- Get the Message all 
-RegisterNUICallback('getviewall', function(data, cb)
-    local ids = data.ids
-    for _, id in ipairs(ids) do
-        TriggerServerEvent('rsg-telegram:server:GetMessages', tonumber(id))
+    local messages = data.list
+    
+    if not messages or #messages == 0 then
+        lib.notify({ 
+            title = "Post Office", 
+            description = "No messages waiting for you", 
+            type = 'info', 
+            duration = 5000 
+        })
+        return
     end
-    TriggerServerEvent('rsg-telegram:server:CheckInbox')
-    cb('ok')
-end)
 
--- Message Data
-RegisterNetEvent('rsg-telegram:client:MessageData')
-AddEventHandler('rsg-telegram:client:MessageData', function(tele)
-    SendNUIMessage
-    ({
-        type = 'view',
-        telegram = tele
-    })
-end)
+    local options = {}
 
--- Delete Message
-RegisterNUICallback('delete', function(data)
-    TriggerServerEvent('rsg-telegram:server:DeleteMessage', tonumber(data.id))
-    TriggerServerEvent('rsg-telegram:server:CheckInbox')
-end)
-
--- Delete Message all
-RegisterNUICallback('deleteall', function(data, cb)
-    local ids = data.ids  -- Un array de IDs
-    for _, id in ipairs(ids) do
-        TriggerServerEvent('rsg-telegram:server:DeleteMessage', tonumber(id))
+    for i, msg in ipairs(messages) do
+        table.insert(options, {
+            title = msg.subject,
+            description = "From: " .. msg.sendername .. " | " .. msg.sentDate,
+            icon = 'fa-solid fa-envelope',
+            iconColor = 'yellow',
+            onSelect = function()
+                local alert = lib.alertDialog({
+                    header = 'Claim Letter?',
+                    content = 'This will add the letter to your inventory.\n\nFrom: **'..msg.sendername..'**\nSubject: **'..msg.subject..'**',
+                    centered = true,
+                    cancel = true,
+                    labels = {
+                        confirm = 'Claim Letter',
+                        cancel = 'Leave It'
+                    }
+                })
+                if alert == 'confirm' then
+                    TriggerServerEvent('rsg-telegram:server:ClaimLetter', msg.id)
+                end
+            end,
+            metadata = {
+                {label = 'From', value = msg.sendername},
+                {label = 'Date', value = msg.sentDate}
+            }
+        })
     end
-    TriggerServerEvent('rsg-telegram:server:CheckInbox')
-    cb('ok')
-end)
 
-RegisterNUICallback('copymsg', function(data, cb)
-    local id = data.id
-    local message = data.message
+    if #messages > 0 then
+        table.insert(options, {
+            title = "───────────────",
+            disabled = true
+        })
 
-    cb({ success = true, message = message })
-end)
+        table.insert(options, {
+            title = "Delete All Messages",
+            icon = 'fa-solid fa-trash',
+            iconColor = 'red',
+            description = "Permanently delete all post office messages",
+            onSelect = function()
+                local alert = lib.alertDialog({
+                    header = 'Delete All?',
+                    content = 'This will delete all ' .. #messages .. ' messages permanently.',
+                    centered = true,
+                    cancel = true
+                })
+                if alert == 'confirm' then
+                    local count = #messages
+                    for _, msg in ipairs(messages) do
+                        TriggerServerEvent('rsg-telegram:server:DeleteMessage', msg.id, true)
+                    end
+                    lib.notify({ 
+                        title = "Success", 
+                        description = count .. " messages deleted", 
+                        type = 'success',
+                        duration = 3000
+                    })
+                    Wait(1000)
+                    TriggerServerEvent('rsg-telegram:server:CheckInbox')
+                end
+            end
+        })
+    end
 
--- Close Mailbox
-RegisterNUICallback('NUIFocusOff', function()
-    InMenu = false
-    SetNuiFocus(false, false)
-
-    SendNUIMessage
-    ({
-        type = 'closeAll'
+    lib.registerContext({
+        id = 'telegram_inbox',
+        title = '📬 Post Office Messages (' .. #messages .. ')',
+        options = options
     })
+    lib.showContext('telegram_inbox')
 end)
 
 -- Cleanup
@@ -683,7 +1225,6 @@ AddEventHandler("onResourceStop", function(resourceName)
 
     for i = 1, #Config.PostOfficeLocations do
         local pos = Config.PostOfficeLocations[i]
-
         exports['rsg-core']:deletePrompt(pos.location)
     end
 
@@ -706,9 +1247,7 @@ RegisterNetEvent('rsg-telegram:client:OpenAddressbook', function()
                 description = locale("cl_title_19"),
                 icon = 'fa-solid fa-book',
                 event = 'rsg-telegram:client:ViewAddressBook',
-                args = {
-                    isServer = false
-                }
+                args = { isServer = false }
             },
             {
                 title = locale("cl_title_20"),
@@ -716,9 +1255,7 @@ RegisterNetEvent('rsg-telegram:client:OpenAddressbook', function()
                 icon = 'fa-solid fa-book',
                 iconColor = 'green',
                 event = 'rsg-telegram:client:AddPersonMenu',
-                args = {
-                    isServer = false
-                }
+                args = { isServer = false }
             },
             {
                 title = locale("cl_title_22"),
@@ -726,19 +1263,16 @@ RegisterNetEvent('rsg-telegram:client:OpenAddressbook', function()
                 icon = 'fa-solid fa-book',
                 iconColor = 'red',
                 event = 'rsg-telegram:client:RemovePersonMenu',
-                args = {
-                    isServer = false
-                }
+                args = { isServer = false }
             },
         }
     })
     lib.showContext('addressbook_menu')
 end)
 
-
 RegisterNetEvent('rsg-telegram:client:AddPersonMenu', function()
     local input = lib.inputDialog(locale("cl_title_24"), {
-        { type = 'input', label = locale("cl_title_25"),      required = true },
+        { type = 'input', label = locale("cl_title_25"), required = true },
         { type = 'input', label = locale("cl_title_26"), required = true },
     })
     if not input then return end
@@ -751,7 +1285,7 @@ RegisterNetEvent('rsg-telegram:client:AddPersonMenu', function()
 end)
 
 RegisterNetEvent('rsg-telegram:client:ViewAddressBook', function()
-    RSGCore.Functions.TriggerCallback('rsg-telegram:server:GetPlayers', function(players)
+    RSGCore.Functions.TriggerCallback('rsg-telegram:server:GetPlayersPostOffice', function(players)
         if players ~= nil then
             local options = {
                 {
@@ -774,17 +1308,15 @@ RegisterNetEvent('rsg-telegram:client:ViewAddressBook', function()
                 description = locale("cl_title_31"),
                 icon = 'fa-solid fa-circle-xmark',
                 event = 'rsg-telegram:client:OpenAddressbook',
-                args = {
-                    isServer = false
-                }
+                args = { isServer = false }
             }
             lib.registerContext({
-                id = 'addressbook_view',  -- Corrected the context ID here
+                id = 'addressbook_view',
                 title = locale("cl_title_32"),
                 position = 'top-right',
                 options = options
             })
-            lib.showContext('addressbook_view')  -- Use the correct context ID here
+            lib.showContext('addressbook_view')
         else
             lib.notify({ title = locale("cl_title_33"), description = locale("cl_title_34"), type = 'error', duration = 7000 })
         end
@@ -792,7 +1324,7 @@ RegisterNetEvent('rsg-telegram:client:ViewAddressBook', function()
 end)
 
 RegisterNetEvent('rsg-telegram:client:RemovePersonMenu', function()
-    RSGCore.Functions.TriggerCallback('rsg-telegram:server:GetPlayers', function(players)
+    RSGCore.Functions.TriggerCallback('rsg-telegram:server:GetPlayersPostOffice', function(players)
         if players ~= nil then
             local option = {}
             for i = 1, #players do
